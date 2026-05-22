@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from urllib.parse import urljoin
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 from bs4 import BeautifulSoup
 
@@ -67,9 +67,46 @@ def _dedupe_links(links: list[DetailLink]) -> list[DetailLink]:
   seen: set[tuple[str, str]] = set()
   deduped: list[DetailLink] = []
   for link in links:
-    key = (link.kind, link.url)
+    key = detail_link_key(link)
     if key in seen:
       continue
     seen.add(key)
     deduped.append(link)
   return deduped
+
+
+def detail_link_key(link: DetailLink) -> tuple[str, str]:
+  parsed = urlsplit(link.url)
+  query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+  if link.kind == 'course' and query.get('p_id'):
+    return (link.kind, query['p_id'])
+  if link.kind == 'teacher' and query.get('p_jsh'):
+    return (link.kind, query['p_jsh'])
+  if link.kind == 'experiment':
+    stable_query = {
+      key: value
+      for key, value in query.items()
+      if key
+      not in {
+        'page',
+        'token',
+        'pathContent',
+        'returnUrl',
+        'timestamp',
+        '_',
+      }
+    }
+    return (link.kind, _url_with_query(parsed, stable_query))
+  return (link.kind, _url_with_query(parsed, query))
+
+
+def _url_with_query(parsed, query: dict[str, str]) -> str:
+  return urlunsplit(
+    (
+      parsed.scheme,
+      parsed.netloc,
+      parsed.path,
+      urlencode(sorted(query.items())),
+      '',
+    )
+  )

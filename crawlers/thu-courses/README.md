@@ -39,6 +39,7 @@ data/processed/thu-courses/<semester>/<run_id>/
   teacher_details.parquet
   experiment_details.parquet
   manifest.json
+  detail_links.parquet
 ```
 
 ## Setup
@@ -110,15 +111,35 @@ Full crawl:
 uv run python crawlers/thu-courses/crawl_opening_info.py --semester 2026-fall
 ```
 
-The crawler uses 8 concurrent requests for opening pages and 8 concurrent
-requests for linked detail pages by default. Tune these if the system is slow or
-unstable:
+The crawler fetches opening pages with 2 requests at a time by default because
+the legacy pagination POST appears to depend on session state and can return the
+wrong page under high concurrency. Linked detail pages use 8 concurrent requests
+by default. Tune these only when you are deliberately trading stability for
+speed:
 
 ```bash
 uv run python crawlers/thu-courses/crawl_opening_info.py \
   --semester 2026-fall \
-  --page-concurrency 8 \
+  --page-concurrency 2 \
   --detail-concurrency 8
+```
+
+Transient network failures are retried 3 times by default. After retries are
+exhausted, the crawler records the failed page/detail request and continues so a
+long run can still write Parquet plus a manifest. Opening pages also get a
+serial repair pass: pages that fail the concurrent pass are retried one at a
+time with `--opening-repair-retries`, which is useful when the legacy pagination
+state gets confused under mild concurrency. Detail pages also get a serial
+repair pass with `--detail-repair-retries`. Use `--fail-fast` when you want
+debugging behavior that stops at the first failed request:
+
+```bash
+uv run python crawlers/thu-courses/crawl_opening_info.py \
+  --semester 2026-fall \
+  --retries 5 \
+  --opening-repair-retries 8 \
+  --detail-repair-retries 8 \
+  --retry-delay 1.5
 ```
 
 The crawler prints progress for opening pages and linked detail pages. Disable
@@ -149,6 +170,7 @@ Semester slug mapping:
 Parquet is the canonical data interface. CSV is intentionally not produced.
 
 - `sections.parquet`: one row per opening table row, including course id, section id, course name, teacher text, credits, department, capacities, remaining seats, schedule text, restrictions/notes, course features, grade, flags, general-education group, and linked detail URLs.
+- `detail_links.parquet`: one row per unique linked detail URL selected for crawling, including the stable dedupe key. This is mainly for auditing run-to-run differences.
 - `course_details.parquet`: one row per unique course detail URL, including course id/name when parseable, credits, description, guidance, prerequisites, teaching features, grading policy, and raw text.
 - `teacher_details.parquet`: one row per unique teacher detail URL, including teacher id, name, title, unit, phone, email, profile, research fields, and raw text.
 - `experiment_details.parquet`: one row per unique experiment detail URL, including semester/course/section identifiers when parseable and raw text.

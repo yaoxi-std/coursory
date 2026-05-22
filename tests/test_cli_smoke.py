@@ -8,6 +8,7 @@ from io import StringIO
 from pathlib import Path
 
 import polars as pl
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CRAWLER_ROOT = REPO_ROOT / 'crawlers' / 'thu-courses'
@@ -67,6 +68,9 @@ def test_fetch_dry_run() -> None:
   assert 'Dry run only' in result.stdout
   assert 'data/processed/thu-courses/2026-fall' in result.stdout
   assert 'p_xnxq=2026-2027-1' in result.stdout
+  assert 'Page concurrency: 2' in result.stdout
+  assert 'Opening repair retries: 5' in result.stdout
+  assert 'Detail repair retries: 5' in result.stdout
 
 
 def test_fetch_help_mentions_progress_option() -> None:
@@ -76,6 +80,10 @@ def test_fetch_help_mentions_progress_option() -> None:
   assert '--no-progress' in result.stdout
   assert '--page-concurrency' in result.stdout
   assert '--detail-concurrency' in result.stdout
+  assert '--retries' in result.stdout
+  assert '--opening-repair-retries' in result.stdout
+  assert '--detail-repair-retries' in result.stdout
+  assert '--fail-fast' in result.stdout
 
 
 def test_progress_bar_writes_readable_status() -> None:
@@ -95,6 +103,58 @@ def test_progress_bar_writes_readable_status() -> None:
   assert 'Opening pages' in output
   assert '1/2' in output
   assert '2/2' in output
+
+
+def test_fetch_with_retries_retries_validation_failure() -> None:
+  attempts = 0
+
+  def operation() -> crawl_opening_info.FetchResult:
+    nonlocal attempts
+    attempts += 1
+    return crawl_opening_info.FetchResult(
+      url='https://example.test/page',
+      status_code=200,
+      content_type='text/html',
+      body=f'body {attempts}',
+    )
+
+  def validate(result: crawl_opening_info.FetchResult) -> None:
+    if result.body != 'body 2':
+      raise crawl_opening_info.RetryableFetchError('wrong semantic page')
+
+  result = crawl_opening_info.fetch_with_retries(
+    operation,
+    label='GET test',
+    retries=1,
+    retry_delay=0,
+    validate=validate,
+  )
+
+  assert attempts == 2
+  assert result.body == 'body 2'
+
+
+def test_bounded_thread_pool_converts_keyboard_interrupt() -> None:
+  submitted: list[int] = []
+
+  def submit(item: int) -> int:
+    submitted.append(item)
+    return item
+
+  def handle(_item, future) -> None:
+    future.result()
+    raise KeyboardInterrupt
+
+  with pytest.raises(crawl_opening_info.CrawlerError, match='stop now'):
+    crawl_opening_info.run_bounded_thread_pool(
+      range(10),
+      max_workers=2,
+      submit=submit,
+      handle=handle,
+      interrupt_message='stop now',
+    )
+
+  assert submitted in ([0], [0, 1])
 
 
 def test_status_without_session_is_actionable(tmp_path: Path) -> None:
@@ -119,6 +179,38 @@ def test_collect_detail_links() -> None:
   assert links[0].course_id == '00040302'
   assert links[0].section_id == '90'
   assert links[0].url.startswith('https://zhjwxk.cic.tsinghua.edu.cn/')
+
+
+def test_detail_link_key_ignores_unstable_context() -> None:
+  first = opening_links.DetailLink(
+    kind='teacher',
+    text='王老师',
+    url='https://zhjwxk.cic.tsinghua.edu.cn/xkBks.vxkBksJxjhBs.do?m=showJsDetail&p_jsh=123&page=1',
+  )
+  second = opening_links.DetailLink(
+    kind='teacher',
+    text='王老师',
+    url='https://zhjwxk.cic.tsinghua.edu.cn/xkBks.vxkBksJxjhBs.do?page=2&p_jsh=123&m=showJsDetail',
+  )
+
+  assert opening_links.detail_link_key(first) == opening_links.detail_link_key(second)
+
+
+def test_detail_link_rows_include_stable_key() -> None:
+  rows = crawl_opening_info.detail_link_rows(
+    [
+      opening_links.DetailLink(
+        kind='course',
+        text='工程域人工智能',
+        url='https://zhjwxk.cic.tsinghua.edu.cn/js.vjsKcbBs.do?m=showToXs&p_id=abc',
+        row_index=1,
+        course_id='00040302',
+        section_id='90',
+      )
+    ]
+  )
+
+  assert rows[0]['stable_key'] == '["course", "abc"]'
 
 
 def test_parse_sections() -> None:

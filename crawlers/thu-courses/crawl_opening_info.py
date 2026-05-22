@@ -4,13 +4,15 @@ import argparse
 import json
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable, Iterable
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
 import httpx
-from opening_links import DetailLink, collect_detail_links
+from opening_links import DetailLink, collect_detail_links, detail_link_key
 from opening_parser import (
+  PageInfo,
   parse_course_detail,
   parse_experiment_detail,
   parse_form_fields,
@@ -45,6 +47,13 @@ class FetchResult:
   body: str
 
 
+class RetryableFetchError(CrawlerError):
+  pass
+
+
+TRANSIENT_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+
+
 class ProgressBar:
   def __init__(
     self,
@@ -70,7 +79,7 @@ class ProgressBar:
     self.current = min(max(current, 0), self.total)
     line = self._line(suffix=suffix)
     if self.is_tty:
-      self.stream.write('\r' + line)
+      self.stream.write('\r\033[K' + line)
       self.stream.flush()
       self.last_line = line
     elif line != self.last_line:
@@ -116,11 +125,14 @@ def crawl(args: argparse.Namespace) -> int:
     print(f'Processed Parquet: {processed_dir}')
     print(f'Max pages: {args.max_pages or "all"}')
     print(f'Page concurrency: {args.page_concurrency}')
+    print(f'Retries: {args.retries}')
+    print(f'Opening repair retries: {args.opening_repair_retries}')
     print(f'Details: {"disabled" if args.skip_details else "all unique links"}')
     print(
       f'Detail limit: {args.detail_limit if args.detail_limit is not None else "all"}'
     )
     print(f'Detail concurrency: {args.detail_concurrency}')
+    print(f'Detail repair retries: {args.detail_repair_retries}')
     return 0
 
   if not STORAGE_STATE_PATH.exists():
@@ -130,6 +142,14 @@ def crawl(args: argparse.Namespace) -> int:
     )
   if args.page_concurrency < 1 or args.detail_concurrency < 1:
     raise CrawlerError('Concurrency values must be positive integers.')
+  if args.retries < 0:
+    raise CrawlerError('Retries must be zero or a positive integer.')
+  if args.opening_repair_retries < 0:
+    raise CrawlerError('Opening repair retries must be zero or a positive integer.')
+  if args.detail_repair_retries < 0:
+    raise CrawlerError('Detail repair retries must be zero or a positive integer.')
+  if args.retry_delay < 0:
+    raise CrawlerError('Retry delay must be zero or a positive number.')
 
   raw_dir.mkdir(parents=True, exist_ok=True)
   processed_dir.mkdir(parents=True, exist_ok=True)
@@ -143,7 +163,16 @@ def crawl(args: argparse.Namespace) -> int:
   requests: list[dict[str, object]] = []
   errors: list[dict[str, object]] = []
 
-  first = fetch_get(entry_url, timeout=args.timeout)
+  first = fetch_get(
+    entry_url,
+    timeout=args.timeout,
+    retries=args.retries,
+    retry_delay=args.retry_delay,
+    validate=lambda result: ensure_expected_opening_page(
+      result.body,
+      expected_page=1,
+    ),
+  )
   ensure_authenticated(first.url, first.body)
   first_info = parse_page_info(first.body)
   total_pages = first_info.total_pages or 1
@@ -175,48 +204,97 @@ def crawl(args: argparse.Namespace) -> int:
   )
 
   page_completed = 1
-  page_errors: list[dict[str, object]] = []
+  page_errors: dict[int, str] = {}
   page_numbers = range(2, max_pages + 1)
-  with ThreadPoolExecutor(max_workers=args.page_concurrency) as executor:
-    futures = {
-      executor.submit(
-        fetch_opening_page,
-        page_number,
-        form_fields,
-        timeout=args.timeout,
-        delay=args.delay,
-      ): page_number
-      for page_number in page_numbers
-    }
-    for future in as_completed(futures):
-      page_number = futures[future]
+
+  def submit_opening_page(page_number: int) -> FetchResult:
+    return fetch_opening_page(
+      page_number,
+      form_fields,
+      timeout=args.timeout,
+      delay=args.delay,
+      retries=args.retries,
+      retry_delay=args.retry_delay,
+    )
+
+  def handle_opening_page(page_number: int, future: Future[FetchResult]) -> None:
+    nonlocal page_completed
+    try:
+      result = future.result()
+      ensure_authenticated(result.url, result.body)
+      page_sections, page_links, page_request = parse_and_record_opening_page(
+        result=result,
+        raw_dir=raw_dir,
+        run_id=run_id,
+        semester=semester,
+        xnxq=xnxq,
+        page_number=page_number,
+      )
+      sections.extend(page_sections)
+      detail_links.extend(page_links)
+      requests.append(page_request)
+    except Exception as exc:
+      page_errors[page_number] = str(exc)
+      if not args.continue_on_error:
+        raise
+    finally:
+      page_completed += 1
+      page_progress.update(
+        page_completed,
+        suffix=f'sections={len(sections)} detail-links={len(detail_links)}',
+      )
+
+  run_bounded_thread_pool(
+    page_numbers,
+    max_workers=args.page_concurrency,
+    submit=submit_opening_page,
+    handle=handle_opening_page,
+    interrupt_message='Interrupted by user while fetching opening pages.',
+  )
+
+  if page_errors:
+    repair_progress = ProgressBar(
+      label='Opening repairs',
+      total=len(page_errors),
+      enabled=not args.no_progress,
+    )
+    for repair_completed, page_number in enumerate(sorted(page_errors), start=1):
       try:
-        result = future.result()
+        result = fetch_opening_page(
+          page_number,
+          form_fields,
+          timeout=args.timeout,
+          delay=args.delay,
+          retries=args.opening_repair_retries,
+          retry_delay=args.retry_delay,
+        )
         ensure_authenticated(result.url, result.body)
-        page_sections, page_links, page_request = record_opening_page(
+        page_sections, page_links, page_request = parse_and_record_opening_page(
           result=result,
           raw_dir=raw_dir,
           run_id=run_id,
           semester=semester,
           xnxq=xnxq,
           page_number=page_number,
-          method='POST',
         )
         sections.extend(page_sections)
         detail_links.extend(page_links)
         requests.append(page_request)
+        del page_errors[page_number]
+        suffix = f'fixed page={page_number} remaining={len(page_errors)}'
       except Exception as exc:
-        page_errors.append({'page': page_number, 'error': str(exc)})
+        page_errors[page_number] = str(exc)
+        suffix = f'failed page={page_number} remaining={len(page_errors)}'
         if not args.continue_on_error:
           raise
-      finally:
-        page_completed += 1
-        page_progress.update(
-          page_completed,
-          suffix=f'sections={len(sections)} detail-links={len(detail_links)}',
-        )
+      repair_progress.update(repair_completed, suffix=suffix)
+    repair_progress.finish(suffix=f'remaining-errors={len(page_errors)}')
+
   page_progress.finish(suffix=f'sections={len(sections)} errors={len(page_errors)}')
-  errors.extend(page_errors)
+  errors.extend(
+    {'page': page_number, 'error': error}
+    for page_number, error in sorted(page_errors.items())
+  )
 
   detail_links = filter_detail_links(detail_links)
   detail_links = sort_detail_links(detail_links)
@@ -229,68 +307,102 @@ def crawl(args: argparse.Namespace) -> int:
       enabled=not args.no_progress,
     )
     detail_completed = 0
-    with ThreadPoolExecutor(max_workers=args.detail_concurrency) as executor:
-      futures = {
-        executor.submit(
-          fetch_detail_page,
-          link,
-          timeout=args.timeout,
-          delay=args.delay,
-        ): (index, link)
-        for index, link in enumerate(detail_links, start=1)
-      }
-      for future in as_completed(futures):
-        index, link = futures[future]
+    detail_errors: dict[int, tuple[DetailLink, str]] = {}
+    indexed_detail_links = list(enumerate(detail_links, start=1))
+
+    def submit_detail_page(item: tuple[int, DetailLink]) -> FetchResult:
+      _index, link = item
+      return fetch_detail_page(
+        link,
+        timeout=args.timeout,
+        delay=args.delay,
+        retries=args.retries,
+        retry_delay=args.retry_delay,
+      )
+
+    def handle_detail_page(
+      item: tuple[int, DetailLink], future: Future[FetchResult]
+    ) -> None:
+      nonlocal detail_completed
+      index, link = item
+      try:
+        result = future.result()
+        ensure_authenticated(result.url, result.body)
+        detail_request = record_detail_page(
+          link=link,
+          result=result,
+          raw_dir=raw_dir,
+          run_id=run_id,
+          index=index,
+          semester=semester,
+          xnxq=xnxq,
+          course_details=course_details,
+          teacher_details=teacher_details,
+          experiment_details=experiment_details,
+        )
+        requests.append(detail_request)
+        detail_suffix = f'{link.kind}: {link.text}'
+      except Exception as exc:
+        detail_errors[index] = (link, str(exc))
+        detail_suffix = f'error {link.kind}: {link.text}'
+        if not args.continue_on_error:
+          raise
+      finally:
+        detail_completed += 1
+        detail_progress.update(detail_completed, suffix=detail_suffix)
+
+    run_bounded_thread_pool(
+      indexed_detail_links,
+      max_workers=args.detail_concurrency,
+      submit=submit_detail_page,
+      handle=handle_detail_page,
+      interrupt_message='Interrupted by user while fetching detail pages.',
+    )
+
+    if detail_errors:
+      repair_progress = ProgressBar(
+        label='Detail repairs',
+        total=len(detail_errors),
+        enabled=not args.no_progress,
+      )
+      for repair_completed, index in enumerate(sorted(detail_errors), start=1):
+        link, _error = detail_errors[index]
         try:
-          result = future.result()
-          ensure_authenticated(result.url, result.body)
-          html_path = write_raw_html(
-            raw_dir=raw_dir,
-            run_id=run_id,
-            prefix=f'detail_{link.kind}',
-            index=index,
-            method='GET',
-            result=result,
-            meta={
-              'source': SOURCE,
-              'semester': semester,
-              'xnxq': xnxq,
-              'fetched_at': utc_now().isoformat(),
-              'detail_kind': link.kind,
-              'detail_text': link.text,
-              'row_index': link.row_index,
-              'course_id': link.course_id,
-              'section_id': link.section_id,
-              'notes': f'Raw {link.kind} detail page retained as ignored audit cache.',
-            },
+          result = fetch_detail_page(
+            link,
+            timeout=args.timeout,
+            delay=args.delay,
+            retries=args.detail_repair_retries,
+            retry_delay=args.retry_delay,
           )
-          parse_detail_row(
+          ensure_authenticated(result.url, result.body)
+          detail_request = record_detail_page(
             link=link,
             result=result,
+            raw_dir=raw_dir,
+            run_id=run_id,
+            index=index,
+            semester=semester,
+            xnxq=xnxq,
             course_details=course_details,
             teacher_details=teacher_details,
             experiment_details=experiment_details,
           )
-          requests.append(
-            {
-              'kind': f'detail_{link.kind}',
-              'detail_text': link.text,
-              'url': result.url,
-              'method': 'GET',
-              'status_code': result.status_code,
-              'content_type': result.content_type,
-              'raw_path': str(html_path),
-            }
-          )
-          detail_suffix = f'{link.kind}: {link.text}'
+          requests.append(detail_request)
+          del detail_errors[index]
+          suffix = f'fixed {link.kind}: {link.text}'
         except Exception as exc:
-          errors.append({'url': link.url, 'kind': link.kind, 'error': str(exc)})
-          detail_suffix = f'error {link.kind}: {link.text}'
+          detail_errors[index] = (link, str(exc))
+          suffix = f'failed {link.kind}: {link.text}'
           if not args.continue_on_error:
             raise
-        finally:
-          detail_completed += 1
-          detail_progress.update(detail_completed, suffix=detail_suffix)
+        repair_progress.update(repair_completed, suffix=suffix)
+      repair_progress.finish(suffix=f'remaining-errors={len(detail_errors)}')
+
+    errors.extend(
+      {'url': link.url, 'kind': link.kind, 'error': error}
+      for _index, (link, error) in sorted(detail_errors.items())
+    )
     detail_progress.finish(
       suffix=(
         f'course={len(course_details)} teacher={len(teacher_details)} '
@@ -301,6 +413,7 @@ def crawl(args: argparse.Namespace) -> int:
   write_outputs(
     processed_dir=processed_dir,
     sections=sections,
+    detail_links=detail_links,
     course_details=course_details,
     teacher_details=teacher_details,
     experiment_details=experiment_details,
@@ -321,6 +434,9 @@ def crawl(args: argparse.Namespace) -> int:
       'pages_crawled': max_pages,
       'page_concurrency': args.page_concurrency,
       'detail_concurrency': args.detail_concurrency,
+      'retries': args.retries,
+      'opening_repair_retries': args.opening_repair_retries,
+      'detail_repair_retries': args.detail_repair_retries,
       'sections': len(sections),
       'detail_links': len(detail_links),
       'course_details': len(course_details),
@@ -329,6 +445,7 @@ def crawl(args: argparse.Namespace) -> int:
       'errors': errors,
       'outputs': {
         'sections': str(processed_dir / 'sections.parquet'),
+        'detail_links': str(processed_dir / 'detail_links.parquet'),
         'course_details': str(processed_dir / 'course_details.parquet'),
         'teacher_details': str(processed_dir / 'teacher_details.parquet'),
         'experiment_details': str(processed_dir / 'experiment_details.parquet'),
@@ -364,10 +481,62 @@ def parse_detail_row(
     experiment_details.append(parse_experiment_detail(result.body, url=result.url))
 
 
+def record_detail_page(
+  *,
+  link: DetailLink,
+  result: FetchResult,
+  raw_dir: Path,
+  run_id: str,
+  index: int,
+  semester: str,
+  xnxq: str,
+  course_details: list[dict[str, object]],
+  teacher_details: list[dict[str, object]],
+  experiment_details: list[dict[str, object]],
+) -> dict[str, object]:
+  html_path = write_raw_html(
+    raw_dir=raw_dir,
+    run_id=run_id,
+    prefix=f'detail_{link.kind}',
+    index=index,
+    method='GET',
+    result=result,
+    meta={
+      'source': SOURCE,
+      'semester': semester,
+      'xnxq': xnxq,
+      'fetched_at': utc_now().isoformat(),
+      'detail_kind': link.kind,
+      'detail_text': link.text,
+      'row_index': link.row_index,
+      'course_id': link.course_id,
+      'section_id': link.section_id,
+      'notes': f'Raw {link.kind} detail page retained as ignored audit cache.',
+    },
+  )
+  parse_detail_row(
+    link=link,
+    result=result,
+    course_details=course_details,
+    teacher_details=teacher_details,
+    experiment_details=experiment_details,
+  )
+  return {
+    'kind': f'detail_{link.kind}',
+    'detail_text': link.text,
+    'url': result.url,
+    'method': 'GET',
+    'status_code': result.status_code,
+    'content_type': result.content_type,
+    'raw_path': str(html_path),
+  }
+
+
 def write_outputs(
   *,
   processed_dir: Path,
   sections: list[dict[str, object]],
+  detail_links: list[DetailLink],
   course_details: list[dict[str, object]],
   teacher_details: list[dict[str, object]],
   experiment_details: list[dict[str, object]],
@@ -376,6 +545,11 @@ def write_outputs(
     processed_dir / 'sections.parquet',
     'sections',
     sorted_sections(sections),
+  )
+  write_parquet_table(
+    processed_dir / 'detail_links.parquet',
+    'detail_links',
+    detail_link_rows(detail_links),
   )
   write_parquet_table(
     processed_dir / 'course_details.parquet',
@@ -391,6 +565,80 @@ def write_outputs(
     processed_dir / 'experiment_details.parquet',
     'experiment_details',
     sorted_rows(experiment_details),
+  )
+
+
+def detail_link_rows(links: list[DetailLink]) -> list[dict[str, object]]:
+  return [
+    {
+      **link.to_dict(),
+      'stable_key': json.dumps(detail_link_key(link), ensure_ascii=False),
+    }
+    for link in links
+  ]
+
+
+def run_bounded_thread_pool[T, R](
+  items: Iterable[T],
+  *,
+  max_workers: int,
+  submit: Callable[[T], R],
+  handle: Callable[[T, Future[R]], None],
+  interrupt_message: str,
+) -> None:
+  item_iterator = iter(items)
+  futures: dict[Future[R], T] = {}
+  executor = ThreadPoolExecutor(max_workers=max_workers)
+
+  def submit_next() -> bool:
+    try:
+      item = next(item_iterator)
+    except StopIteration:
+      return False
+    futures[executor.submit(submit, item)] = item
+    return True
+
+  try:
+    for _ in range(max_workers):
+      if not submit_next():
+        break
+    while futures:
+      for future in as_completed(futures):
+        item = futures.pop(future)
+        handle(item, future)
+        submit_next()
+        break
+  except KeyboardInterrupt as exc:
+    for future in futures:
+      future.cancel()
+    executor.shutdown(wait=False, cancel_futures=True)
+    raise CrawlerError(interrupt_message) from exc
+  except Exception:
+    for future in futures:
+      future.cancel()
+    executor.shutdown(wait=False, cancel_futures=True)
+    raise
+  else:
+    executor.shutdown(wait=True)
+
+
+def parse_and_record_opening_page(
+  *,
+  result: FetchResult,
+  raw_dir: Path,
+  run_id: str,
+  semester: str,
+  xnxq: str,
+  page_number: int,
+) -> tuple[list[dict[str, object]], list[DetailLink], dict[str, object]]:
+  return record_opening_page(
+    result=result,
+    raw_dir=raw_dir,
+    run_id=run_id,
+    semester=semester,
+    xnxq=xnxq,
+    page_number=page_number,
+    method='POST',
   )
 
 
@@ -448,22 +696,109 @@ def fetch_opening_page(
   *,
   timeout: int,
   delay: float,
+  retries: int,
+  retry_delay: float,
 ) -> FetchResult:
   fields = dict(form_fields)
   fields['m'] = 'kkxxSearch'
   fields['page'] = str(page_number)
-  result = fetch_post_form(OPENING_INFO_ENDPOINT, fields, timeout=timeout)
+  result = fetch_post_form(
+    OPENING_INFO_ENDPOINT,
+    fields,
+    timeout=timeout,
+    retries=retries,
+    retry_delay=retry_delay,
+    validate=lambda result: ensure_expected_opening_page(
+      result.body,
+      expected_page=page_number,
+    ),
+  )
   sleep_after_request(delay)
   return result
 
 
-def fetch_detail_page(link: DetailLink, *, timeout: int, delay: float) -> FetchResult:
-  result = fetch_get(link.url, timeout=timeout)
+def fetch_detail_page(
+  link: DetailLink,
+  *,
+  timeout: int,
+  delay: float,
+  retries: int,
+  retry_delay: float,
+) -> FetchResult:
+  result = fetch_get(
+    link.url,
+    timeout=timeout,
+    retries=retries,
+    retry_delay=retry_delay,
+  )
   sleep_after_request(delay)
   return result
 
 
-def fetch_get(url: str, *, timeout: int) -> FetchResult:
+def fetch_get(
+  url: str,
+  *,
+  timeout: int,
+  retries: int,
+  retry_delay: float,
+  validate: Callable[[FetchResult], None] | None = None,
+) -> FetchResult:
+  return fetch_with_retries(
+    lambda: fetch_get_once(url, timeout=timeout),
+    label=f'GET {url}',
+    retries=retries,
+    retry_delay=retry_delay,
+    validate=validate,
+  )
+
+
+def fetch_post_form(
+  url: str,
+  fields: dict[str, str],
+  *,
+  timeout: int,
+  retries: int,
+  retry_delay: float,
+  validate: Callable[[FetchResult], None] | None = None,
+) -> FetchResult:
+  return fetch_with_retries(
+    lambda: fetch_post_form_once(url, fields, timeout=timeout),
+    label=f'POST {url}',
+    retries=retries,
+    retry_delay=retry_delay,
+    validate=validate,
+  )
+
+
+def fetch_with_retries(
+  operation: Callable[[], FetchResult],
+  *,
+  label: str,
+  retries: int,
+  retry_delay: float,
+  validate: Callable[[FetchResult], None] | None = None,
+) -> FetchResult:
+  attempts = max(retries + 1, 1)
+  for attempt in range(1, attempts + 1):
+    try:
+      result = operation()
+      if result.status_code in TRANSIENT_STATUS_CODES:
+        raise RetryableFetchError(
+          f'{label} returned transient HTTP {result.status_code}'
+        )
+      if result.status_code >= 400:
+        raise CrawlerError(f'{label} returned HTTP {result.status_code}')
+      if validate is not None:
+        validate(result)
+      return result
+    except (httpx.TimeoutException, httpx.TransportError, RetryableFetchError) as exc:
+      if attempt >= attempts:
+        raise CrawlerError(f'{label} failed after {attempts} attempts: {exc}') from exc
+      time.sleep(retry_delay * attempt)
+  raise CrawlerError(f'{label} failed unexpectedly.')
+
+
+def fetch_get_once(url: str, *, timeout: int) -> FetchResult:
   with new_http_client(timeout=timeout) as client:
     response = client.get(url)
   content_type = response.headers.get('content-type', '')
@@ -475,7 +810,9 @@ def fetch_get(url: str, *, timeout: int) -> FetchResult:
   )
 
 
-def fetch_post_form(url: str, fields: dict[str, str], *, timeout: int) -> FetchResult:
+def fetch_post_form_once(
+  url: str, fields: dict[str, str], *, timeout: int
+) -> FetchResult:
   with new_http_client(timeout=timeout) as client:
     response = client.post(url, data=fields)
   content_type = response.headers.get('content-type', '')
@@ -532,6 +869,25 @@ def ensure_authenticated(url: str, body: str) -> None:
     raise CrawlerError(
       'Saved session was redirected to the Tsinghua login page. '
       'Re-run `uv run python crawlers/thu-courses/auth.py login`.'
+    )
+
+
+def ensure_expected_opening_page(body: str, *, expected_page: int) -> None:
+  ensure_expected_opening_page_info(
+    parse_page_info(body),
+    expected_page=expected_page,
+  )
+
+
+def ensure_expected_opening_page_info(info: PageInfo, *, expected_page: int) -> None:
+  if info.current_page is None:
+    raise RetryableFetchError(
+      f'Opening-info response for page {expected_page} did not include pagination text.'
+    )
+  if info.current_page != expected_page:
+    raise RetryableFetchError(
+      f'Opening-info response requested page {expected_page}, but returned '
+      f'page {info.current_page}.'
     )
 
 
@@ -592,7 +948,7 @@ def filter_detail_links(links: list[DetailLink]) -> list[DetailLink]:
   seen: set[tuple[str, str]] = set()
   deduped: list[DetailLink] = []
   for link in links:
-    key = (link.kind, link.url)
+    key = detail_link_key(link)
     if key in seen:
       continue
     seen.add(key)
@@ -616,8 +972,8 @@ def build_parser() -> argparse.ArgumentParser:
   parser.add_argument(
     '--page-concurrency',
     type=int,
-    default=8,
-    help='Concurrent opening-info page requests; default is 8.',
+    default=2,
+    help='Concurrent opening-info page requests; default is 2.',
   )
   parser.add_argument(
     '--detail-limit',
@@ -637,9 +993,17 @@ def build_parser() -> argparse.ArgumentParser:
   )
   parser.add_argument(
     '--continue-on-error',
+    dest='continue_on_error',
     action='store_true',
-    help='Record detail-page errors and continue instead of failing immediately.',
+    help='Record request/parser errors and continue. This is the default.',
   )
+  parser.add_argument(
+    '--fail-fast',
+    dest='continue_on_error',
+    action='store_false',
+    help='Stop at the first request/parser error after retries are exhausted.',
+  )
+  parser.set_defaults(continue_on_error=True)
   parser.add_argument(
     '--dry-run',
     action='store_true',
@@ -651,6 +1015,30 @@ def build_parser() -> argparse.ArgumentParser:
     help='Disable crawl progress output.',
   )
   parser.add_argument('--timeout', type=int, default=60)
+  parser.add_argument(
+    '--retries',
+    type=int,
+    default=3,
+    help='Retry transient request failures this many times; default is 3.',
+  )
+  parser.add_argument(
+    '--retry-delay',
+    type=float,
+    default=1.0,
+    help='Base delay in seconds between retries; default is 1.0.',
+  )
+  parser.add_argument(
+    '--opening-repair-retries',
+    type=int,
+    default=5,
+    help='Serial repair retries for opening pages that fail concurrent fetches; default is 5.',
+  )
+  parser.add_argument(
+    '--detail-repair-retries',
+    type=int,
+    default=5,
+    help='Serial repair retries for detail pages that fail concurrent fetches; default is 5.',
+  )
   parser.add_argument(
     '--delay', type=float, default=0.2, help='Delay between requests.'
   )

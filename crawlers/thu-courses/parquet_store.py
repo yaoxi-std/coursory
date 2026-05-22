@@ -34,6 +34,15 @@ TABLE_SCHEMAS: dict[str, dict[str, Any]] = {
     'teacher_detail_url': pl.String,
     'experiment_detail_url': pl.String,
   },
+  'detail_links': {
+    'kind': pl.String,
+    'text': pl.String,
+    'url': pl.String,
+    'row_index': pl.Int64,
+    'course_id': pl.String,
+    'section_id': pl.String,
+    'stable_key': pl.String,
+  },
   'course_details': {
     'url': pl.String,
     'teacher_id': pl.String,
