@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 from importlib import util
+from io import StringIO
 from pathlib import Path
 
 import polars as pl
@@ -27,6 +28,7 @@ thu_common = load_crawler_module('thu_common')
 opening_links = load_crawler_module('opening_links')
 opening_parser = load_crawler_module('opening_parser')
 parquet_store = load_crawler_module('parquet_store')
+crawl_opening_info = load_crawler_module('crawl_opening_info')
 
 
 def run_script(
@@ -65,6 +67,34 @@ def test_fetch_dry_run() -> None:
   assert 'Dry run only' in result.stdout
   assert 'data/processed/thu-courses/2026-fall' in result.stdout
   assert 'p_xnxq=2026-2027-1' in result.stdout
+
+
+def test_fetch_help_mentions_progress_option() -> None:
+  result = run_script('crawlers/thu-courses/crawl_opening_info.py', '--help')
+
+  assert result.returncode == 0
+  assert '--no-progress' in result.stdout
+  assert '--page-concurrency' in result.stdout
+  assert '--detail-concurrency' in result.stdout
+
+
+def test_progress_bar_writes_readable_status() -> None:
+  stream = StringIO()
+  progress = crawl_opening_info.ProgressBar(
+    label='Opening pages',
+    total=2,
+    enabled=True,
+    stream=stream,
+    width=4,
+  )
+
+  progress.update(1, suffix='sections=20')
+  progress.finish()
+
+  output = stream.getvalue()
+  assert 'Opening pages' in output
+  assert '1/2' in output
+  assert '2/2' in output
 
 
 def test_status_without_session_is_actionable(tmp_path: Path) -> None:

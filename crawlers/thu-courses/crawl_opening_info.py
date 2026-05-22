@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
+import httpx
 from opening_links import DetailLink, collect_detail_links
 from opening_parser import (
   parse_course_detail,
@@ -42,28 +45,59 @@ class FetchResult:
   body: str
 
 
-def import_playwright():
-  try:
-    from playwright.sync_api import sync_playwright
-  except ModuleNotFoundError as exc:
-    raise CrawlerError(
-      'Playwright is not installed. Run `uv sync`, then '
-      '`uv run python -m playwright install chromium`.'
-    ) from exc
-  return sync_playwright
+class ProgressBar:
+  def __init__(
+    self,
+    *,
+    label: str,
+    total: int,
+    enabled: bool,
+    stream=sys.stderr,
+    width: int = 28,
+  ) -> None:
+    self.label = label
+    self.total = max(total, 1)
+    self.enabled = enabled
+    self.stream = stream
+    self.width = width
+    self.current = 0
+    self.last_line = ''
+    self.is_tty = bool(getattr(stream, 'isatty', lambda: False)())
 
+  def update(self, current: int, *, suffix: str = '') -> None:
+    if not self.enabled:
+      return
+    self.current = min(max(current, 0), self.total)
+    line = self._line(suffix=suffix)
+    if self.is_tty:
+      self.stream.write('\r' + line)
+      self.stream.flush()
+      self.last_line = line
+    elif line != self.last_line:
+      self.stream.write(line + '\n')
+      self.stream.flush()
+      self.last_line = line
 
-def launch_browser(playwright, *, browser_channel: str | None):
-  kwargs: dict[str, object] = {'headless': True}
-  if browser_channel:
-    kwargs['channel'] = browser_channel
-  try:
-    return playwright.chromium.launch(**kwargs)
-  except Exception as exc:
-    raise CrawlerError(
-      'Could not launch Playwright Chromium. Try '
-      '`uv run python -m playwright install chromium`.'
-    ) from exc
+  def advance(self, *, suffix: str = '') -> None:
+    self.update(self.current + 1, suffix=suffix)
+
+  def finish(self, *, suffix: str = 'done') -> None:
+    if not self.enabled:
+      return
+    self.update(self.total, suffix=suffix)
+    if self.is_tty:
+      self.stream.write('\n')
+      self.stream.flush()
+
+  def _line(self, *, suffix: str) -> str:
+    ratio = self.current / self.total
+    filled = min(self.width, int(self.width * ratio))
+    bar = '#' * filled + '-' * (self.width - filled)
+    percent = int(ratio * 100)
+    suffix_text = f' {suffix}' if suffix else ''
+    return (
+      f'{self.label} [{bar}] {self.current}/{self.total} {percent:3d}%{suffix_text}'
+    )
 
 
 def crawl(args: argparse.Namespace) -> int:
@@ -81,10 +115,12 @@ def crawl(args: argparse.Namespace) -> int:
     print(f'Raw audit cache: {raw_dir}')
     print(f'Processed Parquet: {processed_dir}')
     print(f'Max pages: {args.max_pages or "all"}')
+    print(f'Page concurrency: {args.page_concurrency}')
     print(f'Details: {"disabled" if args.skip_details else "all unique links"}')
     print(
       f'Detail limit: {args.detail_limit if args.detail_limit is not None else "all"}'
     )
+    print(f'Detail concurrency: {args.detail_concurrency}')
     return 0
 
   if not STORAGE_STATE_PATH.exists():
@@ -92,12 +128,12 @@ def crawl(args: argparse.Namespace) -> int:
       f'No saved session exists at {STORAGE_STATE_PATH}. '
       'Run `uv run python crawlers/thu-courses/auth.py login` first.'
     )
+  if args.page_concurrency < 1 or args.detail_concurrency < 1:
+    raise CrawlerError('Concurrency values must be positive integers.')
 
   raw_dir.mkdir(parents=True, exist_ok=True)
   processed_dir.mkdir(parents=True, exist_ok=True)
 
-  browser_channel = None if args.browser == 'chromium' else args.browser
-  sync_playwright = import_playwright()
   started_at = utc_now()
   sections: list[dict[str, object]] = []
   detail_links: list[DetailLink] = []
@@ -107,84 +143,106 @@ def crawl(args: argparse.Namespace) -> int:
   requests: list[dict[str, object]] = []
   errors: list[dict[str, object]] = []
 
-  with sync_playwright() as p:
-    browser = launch_browser(p, browser_channel=browser_channel)
-    context = browser.new_context(storage_state=str(STORAGE_STATE_PATH))
-    api = context.request
+  first = fetch_get(entry_url, timeout=args.timeout)
+  ensure_authenticated(first.url, first.body)
+  first_info = parse_page_info(first.body)
+  total_pages = first_info.total_pages or 1
+  max_pages = min(total_pages, args.max_pages) if args.max_pages else total_pages
+  form_fields = parse_form_fields(first.body)
+  if not form_fields.get('token'):
+    raise CrawlerError('Opening-info page did not contain the expected hidden token.')
 
-    first = fetch_get(api, entry_url, timeout=args.timeout)
-    ensure_authenticated(first.url, first.body)
-    first_info = parse_page_info(first.body)
-    total_pages = first_info.total_pages or 1
-    max_pages = min(total_pages, args.max_pages) if args.max_pages else total_pages
-    form_fields = parse_form_fields(first.body)
-    if not form_fields.get('token'):
-      browser.close()
-      raise CrawlerError('Opening-info page did not contain the expected hidden token.')
+  page_progress = ProgressBar(
+    label='Opening pages',
+    total=max_pages,
+    enabled=not args.no_progress,
+  )
+  first_sections, first_links, first_request = record_opening_page(
+    result=first,
+    raw_dir=raw_dir,
+    run_id=run_id,
+    semester=semester,
+    xnxq=xnxq,
+    page_number=1,
+    method='GET',
+  )
+  sections.extend(first_sections)
+  detail_links.extend(first_links)
+  requests.append(first_request)
+  page_progress.update(
+    1,
+    suffix=f'sections={len(sections)} detail-links={len(detail_links)}',
+  )
 
-    for page_number in range(1, max_pages + 1):
-      if page_number == 1:
-        result = first
-        method = 'GET'
-      else:
-        form_fields['m'] = 'kkxxSearch'
-        form_fields['page'] = str(page_number)
-        result = fetch_post_form(
-          api,
-          OPENING_INFO_ENDPOINT,
-          form_fields,
-          timeout=args.timeout,
-        )
-        method = 'POST'
+  page_completed = 1
+  page_errors: list[dict[str, object]] = []
+  page_numbers = range(2, max_pages + 1)
+  with ThreadPoolExecutor(max_workers=args.page_concurrency) as executor:
+    futures = {
+      executor.submit(
+        fetch_opening_page,
+        page_number,
+        form_fields,
+        timeout=args.timeout,
+        delay=args.delay,
+      ): page_number
+      for page_number in page_numbers
+    }
+    for future in as_completed(futures):
+      page_number = futures[future]
+      try:
+        result = future.result()
         ensure_authenticated(result.url, result.body)
-        form_fields = parse_form_fields(result.body) or form_fields
-
-      html_path = write_raw_html(
-        raw_dir=raw_dir,
-        run_id=run_id,
-        prefix='opening_info',
-        index=page_number,
-        method=method,
-        result=result,
-        meta={
-          'source': SOURCE,
-          'semester': semester,
-          'xnxq': xnxq,
-          'fetched_at': utc_now().isoformat(),
-          'page': page_number,
-          'notes': 'Raw opening-info page retained as ignored audit cache.',
-        },
-      )
-      info = parse_page_info(result.body)
-      requests.append(
-        {
-          'kind': 'opening_info',
-          'page': page_number,
-          'url': result.url,
-          'method': method,
-          'status_code': result.status_code,
-          'content_type': result.content_type,
-          'raw_path': str(html_path),
-          **info.to_dict(),
-        }
-      )
-      sections.extend(
-        parse_sections(
-          result.body,
-          base_url=result.url,
+        page_sections, page_links, page_request = record_opening_page(
+          result=result,
+          raw_dir=raw_dir,
+          run_id=run_id,
           semester=semester,
           xnxq=xnxq,
-          page=page_number,
+          page_number=page_number,
+          method='POST',
         )
-      )
-      detail_links.extend(collect_detail_links(result.body, result.url))
-      time.sleep(args.delay)
+        sections.extend(page_sections)
+        detail_links.extend(page_links)
+        requests.append(page_request)
+      except Exception as exc:
+        page_errors.append({'page': page_number, 'error': str(exc)})
+        if not args.continue_on_error:
+          raise
+      finally:
+        page_completed += 1
+        page_progress.update(
+          page_completed,
+          suffix=f'sections={len(sections)} detail-links={len(detail_links)}',
+        )
+  page_progress.finish(suffix=f'sections={len(sections)} errors={len(page_errors)}')
+  errors.extend(page_errors)
 
-    detail_links = filter_detail_links(detail_links, limit=args.detail_limit)
-    if not args.skip_details:
-      for index, link in enumerate(detail_links, start=1):
+  detail_links = filter_detail_links(detail_links)
+  detail_links = sort_detail_links(detail_links)
+  if args.detail_limit is not None:
+    detail_links = detail_links[: args.detail_limit]
+  if not args.skip_details:
+    detail_progress = ProgressBar(
+      label='Detail pages',
+      total=len(detail_links),
+      enabled=not args.no_progress,
+    )
+    detail_completed = 0
+    with ThreadPoolExecutor(max_workers=args.detail_concurrency) as executor:
+      futures = {
+        executor.submit(
+          fetch_detail_page,
+          link,
+          timeout=args.timeout,
+          delay=args.delay,
+        ): (index, link)
+        for index, link in enumerate(detail_links, start=1)
+      }
+      for future in as_completed(futures):
+        index, link = futures[future]
         try:
-          result = fetch_get(api, link.url, timeout=args.timeout)
+          result = future.result()
           ensure_authenticated(result.url, result.body)
           html_path = write_raw_html(
             raw_dir=raw_dir,
@@ -224,14 +282,21 @@ def crawl(args: argparse.Namespace) -> int:
               'raw_path': str(html_path),
             }
           )
-          time.sleep(args.delay)
+          detail_suffix = f'{link.kind}: {link.text}'
         except Exception as exc:
           errors.append({'url': link.url, 'kind': link.kind, 'error': str(exc)})
+          detail_suffix = f'error {link.kind}: {link.text}'
           if not args.continue_on_error:
-            browser.close()
             raise
-
-    browser.close()
+        finally:
+          detail_completed += 1
+          detail_progress.update(detail_completed, suffix=detail_suffix)
+    detail_progress.finish(
+      suffix=(
+        f'course={len(course_details)} teacher={len(teacher_details)} '
+        f'experiment={len(experiment_details)} errors={len(errors)}'
+      )
+    )
 
   write_outputs(
     processed_dir=processed_dir,
@@ -254,6 +319,8 @@ def crawl(args: argparse.Namespace) -> int:
       'processed_dir': str(processed_dir),
       'total_pages_seen': total_pages,
       'pages_crawled': max_pages,
+      'page_concurrency': args.page_concurrency,
+      'detail_concurrency': args.detail_concurrency,
       'sections': len(sections),
       'detail_links': len(detail_links),
       'course_details': len(course_details),
@@ -305,50 +372,159 @@ def write_outputs(
   teacher_details: list[dict[str, object]],
   experiment_details: list[dict[str, object]],
 ) -> None:
-  write_parquet_table(processed_dir / 'sections.parquet', 'sections', sections)
   write_parquet_table(
-    processed_dir / 'course_details.parquet', 'course_details', course_details
+    processed_dir / 'sections.parquet',
+    'sections',
+    sorted_sections(sections),
   )
   write_parquet_table(
-    processed_dir / 'teacher_details.parquet', 'teacher_details', teacher_details
+    processed_dir / 'course_details.parquet',
+    'course_details',
+    sorted_rows(course_details),
+  )
+  write_parquet_table(
+    processed_dir / 'teacher_details.parquet',
+    'teacher_details',
+    sorted_rows(teacher_details),
   )
   write_parquet_table(
     processed_dir / 'experiment_details.parquet',
     'experiment_details',
-    experiment_details,
+    sorted_rows(experiment_details),
   )
 
 
-def fetch_get(api, url: str, *, timeout: int) -> FetchResult:
-  response = api.get(url, timeout=timeout * 1000)
-  content_type = response.headers.get('content-type', '')
-  return FetchResult(
-    url=response.url,
-    status_code=response.status,
-    content_type=content_type,
-    body=decode_response_body(response.body(), content_type),
-  )
-
-
-def fetch_post_form(
-  api, url: str, fields: dict[str, str], *, timeout: int
-) -> FetchResult:
-  response = api.fetch(
-    url,
-    method='POST',
-    form=fields,
-    timeout=timeout * 1000,
-    headers={
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+def record_opening_page(
+  *,
+  result: FetchResult,
+  raw_dir: Path,
+  run_id: str,
+  semester: str,
+  xnxq: str,
+  page_number: int,
+  method: str,
+) -> tuple[list[dict[str, object]], list[DetailLink], dict[str, object]]:
+  html_path = write_raw_html(
+    raw_dir=raw_dir,
+    run_id=run_id,
+    prefix='opening_info',
+    index=page_number,
+    method=method,
+    result=result,
+    meta={
+      'source': SOURCE,
+      'semester': semester,
+      'xnxq': xnxq,
+      'fetched_at': utc_now().isoformat(),
+      'page': page_number,
+      'notes': 'Raw opening-info page retained as ignored audit cache.',
     },
   )
+  info = parse_page_info(result.body)
+  sections = parse_sections(
+    result.body,
+    base_url=result.url,
+    semester=semester,
+    xnxq=xnxq,
+    page=page_number,
+  )
+  links = collect_detail_links(result.body, result.url)
+  request: dict[str, object] = {
+    'kind': 'opening_info',
+    'page': page_number,
+    'url': result.url,
+    'method': method,
+    'status_code': result.status_code,
+    'content_type': result.content_type,
+    'raw_path': str(html_path),
+    **info.to_dict(),
+  }
+  return sections, links, request
+
+
+def fetch_opening_page(
+  page_number: int,
+  form_fields: dict[str, str],
+  *,
+  timeout: int,
+  delay: float,
+) -> FetchResult:
+  fields = dict(form_fields)
+  fields['m'] = 'kkxxSearch'
+  fields['page'] = str(page_number)
+  result = fetch_post_form(OPENING_INFO_ENDPOINT, fields, timeout=timeout)
+  sleep_after_request(delay)
+  return result
+
+
+def fetch_detail_page(link: DetailLink, *, timeout: int, delay: float) -> FetchResult:
+  result = fetch_get(link.url, timeout=timeout)
+  sleep_after_request(delay)
+  return result
+
+
+def fetch_get(url: str, *, timeout: int) -> FetchResult:
+  with new_http_client(timeout=timeout) as client:
+    response = client.get(url)
   content_type = response.headers.get('content-type', '')
   return FetchResult(
-    url=response.url,
-    status_code=response.status,
+    url=str(response.url),
+    status_code=response.status_code,
     content_type=content_type,
-    body=decode_response_body(response.body(), content_type),
+    body=decode_response_body(response.content, content_type),
   )
+
+
+def fetch_post_form(url: str, fields: dict[str, str], *, timeout: int) -> FetchResult:
+  with new_http_client(timeout=timeout) as client:
+    response = client.post(url, data=fields)
+  content_type = response.headers.get('content-type', '')
+  return FetchResult(
+    url=str(response.url),
+    status_code=response.status_code,
+    content_type=content_type,
+    body=decode_response_body(response.content, content_type),
+  )
+
+
+def new_http_client(*, timeout: int) -> httpx.Client:
+  return httpx.Client(
+    cookies=load_storage_cookies(),
+    follow_redirects=True,
+    trust_env=False,
+    timeout=httpx.Timeout(timeout),
+    headers={
+      'User-Agent': (
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari/537.36'
+      ),
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    },
+  )
+
+
+def load_storage_cookies() -> httpx.Cookies:
+  state = json.loads(STORAGE_STATE_PATH.read_text(encoding='utf-8'))
+  cookies = httpx.Cookies()
+  for cookie in state.get('cookies', []):
+    name = cookie.get('name')
+    value = cookie.get('value')
+    domain = cookie.get('domain')
+    if not name or value is None or not domain:
+      continue
+    cookies.set(
+      str(name),
+      str(value),
+      domain=str(domain),
+      path=str(cookie.get('path') or '/'),
+    )
+  return cookies
+
+
+def sleep_after_request(delay: float) -> None:
+  if delay > 0:
+    time.sleep(delay)
 
 
 def ensure_authenticated(url: str, body: str) -> None:
@@ -384,9 +560,35 @@ def write_raw_html(
   return html_path
 
 
-def filter_detail_links(
-  links: list[DetailLink], *, limit: int | None
-) -> list[DetailLink]:
+def sorted_sections(sections: list[dict[str, object]]) -> list[dict[str, object]]:
+  return sorted(
+    sections,
+    key=lambda row: (
+      int(row.get('page') or 0),
+      int(row.get('row_index') or 0),
+      str(row.get('course_id') or ''),
+      str(row.get('section_id') or ''),
+    ),
+  )
+
+
+def sorted_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+  return sorted(rows, key=lambda row: str(row.get('url') or ''))
+
+
+def sort_detail_links(links: list[DetailLink]) -> list[DetailLink]:
+  return sorted(
+    links,
+    key=lambda link: (
+      link.course_id or '',
+      link.section_id or '',
+      link.kind,
+      link.url,
+    ),
+  )
+
+
+def filter_detail_links(links: list[DetailLink]) -> list[DetailLink]:
   seen: set[tuple[str, str]] = set()
   deduped: list[DetailLink] = []
   for link in links:
@@ -395,8 +597,6 @@ def filter_detail_links(
       continue
     seen.add(key)
     deduped.append(link)
-    if limit is not None and len(deduped) >= limit:
-      break
   return deduped
 
 
@@ -414,9 +614,21 @@ def build_parser() -> argparse.ArgumentParser:
     help='Fetch at most this many opening-info pages; default is all pages.',
   )
   parser.add_argument(
+    '--page-concurrency',
+    type=int,
+    default=8,
+    help='Concurrent opening-info page requests; default is 8.',
+  )
+  parser.add_argument(
     '--detail-limit',
     type=int,
     help='Fetch at most this many unique detail links; default is all details.',
+  )
+  parser.add_argument(
+    '--detail-concurrency',
+    type=int,
+    default=8,
+    help='Concurrent detail-page requests; default is 8.',
   )
   parser.add_argument(
     '--skip-details',
@@ -434,7 +646,9 @@ def build_parser() -> argparse.ArgumentParser:
     help='Validate args and print planned paths without network access.',
   )
   parser.add_argument(
-    '--browser', choices=['chromium', 'chrome', 'msedge'], default='chrome'
+    '--no-progress',
+    action='store_true',
+    help='Disable crawl progress output.',
   )
   parser.add_argument('--timeout', type=int, default=60)
   parser.add_argument(

@@ -110,6 +110,26 @@ Full crawl:
 uv run python crawlers/thu-courses/crawl_opening_info.py --semester 2026-fall
 ```
 
+The crawler uses 8 concurrent requests for opening pages and 8 concurrent
+requests for linked detail pages by default. Tune these if the system is slow or
+unstable:
+
+```bash
+uv run python crawlers/thu-courses/crawl_opening_info.py \
+  --semester 2026-fall \
+  --page-concurrency 8 \
+  --detail-concurrency 8
+```
+
+The crawler prints progress for opening pages and linked detail pages. Disable
+progress output when writing logs or running in a quiet environment:
+
+```bash
+uv run python crawlers/thu-courses/crawl_opening_info.py \
+  --semester 2026-fall \
+  --no-progress
+```
+
 Skip linked detail pages and write only opening rows plus detail URLs:
 
 ```bash
