@@ -2,7 +2,7 @@
 
 English / [简体中文](README.zh.md)
 
-Local-first course data fetching and interactive schedule-planning workspace.
+A local workspace for fetching course data and planning schedules with an agent.
 
 Coursory is meant to be used with a local coding agent. The crawler scripts and
 Parquet files are implementation details for the agent; as a user, you normally
@@ -92,5 +92,5 @@ not for ordinary course-planning conversations.
 
 ## Acknowledgements
 
-Thanks to Codex. This project was co-authored by the maintainer and Codex in one
-half-afternoon working session.
+Thanks to Codex. This project was co-authored by the maintainer and Codex in
+half an afternoon.
