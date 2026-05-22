@@ -1,0 +1,14 @@
+.local/
+.env
+.env.*
+!.env.example
+*.cookie
+*.har
+*.log
+*.tmp
+*storage_state*.json
+*session*.json
+*_network_findings.json
+downloads/
+screenshots/
+traces/

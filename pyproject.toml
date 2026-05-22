@@ -1,0 +1,23 @@
+[project]
+name = "coursory"
+version = "0.1.0"
+description = "Local-first course data fetching and schedule-planning workspace."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "beautifulsoup4>=4.13.0",
+  "httpx>=0.28.0",
+  "lxml>=6.0.0",
+  "playwright>=1.56.0",
+  "polars>=1.36.0",
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=9.0.0",
+  "ruff>=0.15.0",
+  "ty>=0.0.31",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

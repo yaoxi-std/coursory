@@ -1,0 +1,29 @@
+.local/
+.env
+.env.*
+!.env.example
+*.cookie
+*.har
+*.log
+*.tmp
+*storage_state*.json
+*session*.json
+data/raw/
+data/processed/
+
+# Python/editor noise
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.ty_cache/
+.DS_Store
+
+# Browser/test artifacts
+playwright-report/
+test-results/
+downloads/
+screenshots/
+traces/
