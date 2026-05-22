@@ -1,12 +1,17 @@
 # AGENTS.md
 
-This file is the project rule SSOT for coding agents and contributors.
+This file is the project rule SSOT for repository development.
+
+For end-user course planning, start Codex from `course-planning/` so
+`course-planning/AGENTS.md` is automatically loaded. Do not use this root
+development file as the course-planning workflow.
 
 ## Repository Boundary
 
 - The repository root is a local-first Python workspace for fetching course data and interactively planning schedules.
 - `crawlers/` contains independent school-specific crawler backends.
 - `crawlers/thu-courses/` is specific to Tsinghua University course data.
+- `course-planning/` contains runtime agent rules for local interactive planning.
 - Do not turn this repository into a full course-selection app.
 - Do not submit course selections, add/drop courses, join waitlists, confirm enrollment, or perform any state-changing action in school systems.
 - Do not create future school backends, parser layers, UI apps, databases, or automation services before they are needed.
@@ -16,6 +21,7 @@ This file is the project rule SSOT for coding agents and contributors.
 - `README.md`, if present, is only for a short project description and local commands.
 - Root `AGENTS.md` is only for contributor and coding-agent rules shared by the whole repository.
 - School-specific crawler operating rules belong in that crawler's own `AGENTS.md`.
+- Runtime course-planning rules belong in `course-planning/AGENTS.md`.
 - `docs/`, if introduced later, stores product, architecture, data-model, and phase design.
 - Keep documentation strict, concise, English-only, and split by topic.
 
