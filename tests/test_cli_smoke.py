@@ -12,6 +12,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CRAWLER_ROOT = REPO_ROOT / 'crawlers' / 'thu-courses'
+PKU_CRAWLER_ROOT = REPO_ROOT / 'crawlers' / 'pku-courses'
 sys.path.insert(0, str(CRAWLER_ROOT))
 
 
@@ -30,6 +31,21 @@ opening_links = load_crawler_module('opening_links')
 opening_parser = load_crawler_module('opening_parser')
 parquet_store = load_crawler_module('parquet_store')
 crawl_opening_info = load_crawler_module('crawl_opening_info')
+
+
+def load_pku_module(name: str):
+  sys.path.insert(0, str(PKU_CRAWLER_ROOT))
+  spec = util.spec_from_file_location(f'pku_{name}', PKU_CRAWLER_ROOT / f'{name}.py')
+  if spec is None or spec.loader is None:
+    raise RuntimeError(f'Could not load {name}.py')
+  module = util.module_from_spec(spec)
+  sys.modules[spec.name] = module
+  spec.loader.exec_module(module)
+  return module
+
+
+pku_common = load_pku_module('pku_common')
+pku_course_parser = load_pku_module('course_parser')
 
 
 def run_script(
@@ -66,7 +82,7 @@ def test_fetch_dry_run() -> None:
 
   assert result.returncode == 0
   assert 'Dry run only' in result.stdout
-  assert 'data/processed/thu-courses/2026-fall' in result.stdout
+  assert 'data/processed/thu-courses/2026-fall' in result.stdout.replace('\\', '/')
   assert 'p_xnxq=2026-2027-1' in result.stdout
   assert 'Page concurrency: 2' in result.stdout
   assert 'Opening repair retries: 5' in result.stdout
@@ -84,6 +100,32 @@ def test_fetch_help_mentions_progress_option() -> None:
   assert '--opening-repair-retries' in result.stdout
   assert '--detail-repair-retries' in result.stdout
   assert '--fail-fast' in result.stdout
+
+
+def test_pku_fetch_dry_run() -> None:
+  result = run_script(
+    'crawlers/pku-courses/crawl_course_search.py',
+    '--semester',
+    '2026-spring',
+    '--dry-run',
+  )
+
+  assert result.returncode == 0
+  assert 'Dry run only' in result.stdout
+  assert 'data/processed/pku-courses/2026-spring' in result.stdout.replace('\\', '/')
+  assert 'yearandseme: 25-26-2' in result.stdout
+  assert 'courseSearch_do.php' in result.stdout
+
+
+def test_pku_fetch_help_mentions_captcha_option() -> None:
+  result = run_script('crawlers/pku-courses/crawl_course_search.py', '--help')
+
+  assert result.returncode == 0
+  assert '--captcha-code' in result.stdout
+  assert '--prepare-captcha' in result.stdout
+  assert '--resume-session' in result.stdout
+  assert '--department' in result.stdout
+  assert '--skip-details' in result.stdout
 
 
 def test_progress_bar_writes_readable_status() -> None:
@@ -167,6 +209,13 @@ def test_status_without_session_is_actionable(tmp_path: Path) -> None:
 def test_semester_to_xnxq() -> None:
   assert thu_common.semester_to_xnxq('2026-fall') == '2026-2027-1'
   assert thu_common.semester_to_xnxq('2026-spring') == '2025-2026-2'
+
+
+def test_pku_semester_to_yearandseme() -> None:
+  assert pku_common.semester_to_yearandseme('2025-fall') == '25-26-1'
+  assert pku_common.semester_to_yearandseme('2026-spring') == '25-26-2'
+  assert pku_common.semester_to_yearandseme('2026-summer') == '25-26-3'
+  assert pku_common.semester_to_yearandseme('2026-fall') == '26-27-1'
 
 
 def test_collect_detail_links() -> None:
@@ -263,6 +312,68 @@ def test_parse_detail_pages() -> None:
   assert course['credits'] == 2.0
   assert teacher['teacher_id'] == '2003990024'
   assert teacher['name'] == '张嘎'
+
+
+def test_pku_parse_section_and_detail() -> None:
+  section = pku_course_parser.parse_section_row(
+    {
+      'xh': 1,
+      'kch': '00100878',
+      'kcmc': '量化交易',
+      'kctxm': '专业任选',
+      'kkxsmc': '数学科学学院',
+      'jxbh': '1',
+      'xf': '2',
+      'zxjhbh': 'BZ2526200100878_12085',
+      'qzz': '1-15',
+      'sksj': '<p>星期二(第5节-第6节)</p>',
+      'teacher': '<p>吴岚</p>',
+      'bz': '一教303',
+    },
+    semester='2026-spring',
+    yearandseme='25-26-2',
+    startrow=0,
+    row_index=0,
+  )
+
+  assert section['course_id'] == '00100878'
+  assert section['credits'] == 2.0
+  assert section['schedule'] == '星期二(第5节-第6节)'
+  assert section['teacher'] == '吴岚'
+  assert section['course_detail_url'].endswith('zxjhbh=BZ2526200100878_12085')
+
+  detail = pku_course_parser.parse_course_detail(
+    """
+    <html><body>
+      <p class="detailTit">量化交易<span>Quantitative Trading</span></p>
+      <div class="detailsList"><span>课程号:</span><span>00100878</span></div>
+      <div class="detailsList"><span>学分:</span><span>2</span></div>
+      <div class="detailsList"><span>先修课程:</span><span>概率论</span></div>
+      <div class="detailsList"><span>开课院系:</span><span>数学科学学院</span></div>
+      <div class="detailsList"><span>中文简介:</span><span>课程简介。</span></div>
+      <div class="detailsList"><span>英文简介:</span><span>Course description.</span></div>
+    </body></html>
+    """,
+    url='https://dean.pku.edu.cn/service/web/courseDetail.php?flag=1&zxjhbh=BZ2526200100878_12085',
+  )
+
+  assert detail['plan_id'] == 'BZ2526200100878_12085'
+  assert detail['title_zh'] == '量化交易'
+  assert detail['title_en'] == 'Quantitative Trading'
+  assert detail['description_zh'] == '课程简介。'
+
+
+def test_pku_teacher_rows_from_sections() -> None:
+  rows = pku_course_parser.teacher_detail_rows(
+    [
+      {'teacher': '甲、乙', 'course_id': '001', 'course_name': '课程一'},
+      {'teacher': '甲', 'course_id': '002', 'course_name': '课程二'},
+    ]
+  )
+
+  assert [row['name'] for row in rows] == ['乙', '甲']
+  assert rows[1]['source_section_count'] == 2
+  assert rows[1]['profile'] is None
 
 
 def test_parquet_write_smoke(tmp_path: Path) -> None:
