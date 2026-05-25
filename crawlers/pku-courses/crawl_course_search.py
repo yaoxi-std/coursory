@@ -274,6 +274,39 @@ def bootstrap_public_session(client: httpx.Client, *, timeout: int) -> None:
     raise CrawlerError(f'Course search page returned HTTP {result.status_code}.')
 
 
+def response_payload(
+  response: httpx.Response, *, context: str, retryable: bool = False
+) -> dict[str, object]:
+  if response.status_code >= 400:
+    message = f'{context} returned HTTP {response.status_code}.'
+    if retryable:
+      raise RetryableFetchError(message)
+    raise CrawlerError(message)
+  try:
+    payload = response.json()
+  except ValueError as exc:
+    message = f'{context} returned invalid JSON.'
+    if retryable:
+      raise RetryableFetchError(message) from exc
+    raise CrawlerError(message) from exc
+  if not isinstance(payload, dict):
+    message = f'{context} returned unexpected JSON.'
+    if retryable:
+      raise RetryableFetchError(message)
+    raise CrawlerError(message)
+  return payload
+
+
+def payload_code(payload: dict[str, object]) -> int:
+  value = payload.get('code')
+  if isinstance(value, int):
+    return value
+  if isinstance(value, str):
+    with suppress(ValueError):
+      return int(value)
+  return 0
+
+
 def ensure_search_allowed(
   client: httpx.Client,
   captcha_provider: CaptchaProvider,
@@ -282,8 +315,8 @@ def ensure_search_allowed(
   prefer_existing_captcha: bool,
 ) -> None:
   response = client.post(CHECK_SEARCH_URL, timeout=timeout)
-  payload = response.json()
-  if int(payload.get('code') or 0) == 1:
+  payload = response_payload(response, context='Search permission check')
+  if payload_code(payload) == 1:
     return
   solve_captcha(
     client,
@@ -313,8 +346,13 @@ def solve_captcha(
     if not code:
       continue
     check = client.post(CHECK_CAPTCHA_URL, data={'code': code}, timeout=timeout)
-    payload = check.json()
-    if int(payload.get('code') or 0) == 1:
+    try:
+      payload = response_payload(check, context='Captcha check', retryable=True)
+    except RetryableFetchError as exc:
+      safe_print(f'{exc} Retrying with a fresh captcha.')
+      prefer_existing_captcha = False
+      continue
+    if payload_code(payload) == 1:
       safe_print('Captcha accepted.')
       return
     safe_print(f'Captcha rejected: {payload.get("msg") or "unknown error"}')

@@ -48,7 +48,7 @@ def ensure_local_dir() -> None:
 def validate_semester(value: str) -> str:
   if not re.fullmatch(r'\d{4}-(spring|summer|fall|autumn)', value):
     raise CrawlerError(
-      'Semester must look like 2026-spring, 2026-summer, or 2026-fall.'
+      'Semester must look like 2026-spring, 2026-summer, 2026-fall, or 2026-autumn.'
     )
   return value
 

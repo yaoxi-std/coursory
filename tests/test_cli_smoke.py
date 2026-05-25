@@ -3,7 +3,8 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-from importlib import util
+from contextlib import contextmanager
+from importlib import import_module, util
 from io import StringIO
 from pathlib import Path
 
@@ -33,15 +34,22 @@ parquet_store = load_crawler_module('parquet_store')
 crawl_opening_info = load_crawler_module('crawl_opening_info')
 
 
+@contextmanager
+def prepended_sys_path(path: Path):
+  path_text = str(path)
+  inserted = path_text not in sys.path
+  if inserted:
+    sys.path.insert(0, path_text)
+  try:
+    yield
+  finally:
+    if inserted:
+      sys.path.remove(path_text)
+
+
 def load_pku_module(name: str):
-  sys.path.insert(0, str(PKU_CRAWLER_ROOT))
-  spec = util.spec_from_file_location(f'pku_{name}', PKU_CRAWLER_ROOT / f'{name}.py')
-  if spec is None or spec.loader is None:
-    raise RuntimeError(f'Could not load {name}.py')
-  module = util.module_from_spec(spec)
-  sys.modules[spec.name] = module
-  spec.loader.exec_module(module)
-  return module
+  with prepended_sys_path(PKU_CRAWLER_ROOT):
+    return import_module(name)
 
 
 pku_common = load_pku_module('pku_common')
